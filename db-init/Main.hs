@@ -4,6 +4,7 @@ import Development.CodeCompass.Parser.Plugin
 import Database.Persist
 import Database.Persist.Sqlite
 import Database.Persist.TH
+import Development.CodeCompass.Schema
 
 import Control.Monad
 import System.Directory

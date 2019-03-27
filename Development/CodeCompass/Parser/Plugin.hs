@@ -11,6 +11,7 @@
 {-# LANGUAGE ViewPatterns               #-}
 {-# LANGUAGE RankNTypes                 #-}
 {-# LANGUAGE UndecidableInstances       #-}
+{-# LANGUAGE TupleSections              #-}
 module Development.CodeCompass.Parser.Plugin where
 
 import DynFlags (getDynFlags)
@@ -30,9 +31,13 @@ import FastString
 import Module
 import Avail
 import Outputable
+import HsExpr
 import HsDoc
+import HsTypes
 
-import Data.List (nubBy, sortOn)
+import Data.Maybe
+import Data.Data (toConstr)
+import Data.List (nubBy, sortOn, find)
 import Data.Function
 import qualified Data.Map as Map
 import Data.Generics.Uniplate.Operations
@@ -42,7 +47,7 @@ import Control.Monad
 import Control.Monad.Catch
 import Control.Monad.State
 import Control.Monad.IO.Unlift
-import Data.Text hiding (drop, dropWhile, filter, length, map, concatMap, concat)
+import Data.Text hiding (drop, dropWhile, filter, length, map, concatMap, concat, find)
 import Control.Monad.Reader
 import Control.Monad.Logger
 import Conduit
@@ -50,52 +55,11 @@ import Database.Persist
 import Database.Persist.Sqlite
 import Database.Persist.TH
 import Control.Monad.IO.Class
-import Control.Lens hiding (element)
+import Control.Lens hiding (Context(..), element)
 import GHC.Stack
+import TcEvidence
 
-share [mkPersist sqlSettings, mkMigrate "migrateAll"] [persistLowerCase|
-HsFile
-    filename String
-    module HsModuleId
-    deriving Show
-    deriving Eq
-    deriving Ord
-    UniqueFilename filename
-HsSourceLoc
-    module HsModuleId
-    file HsFileId
-    startRow Int
-    startCol Int
-    endRow Int
-    endCol Int
-    deriving Show
-    deriving Eq
-    deriving Ord
-    UniqueSourceLoc file startRow startCol
-HsName
-    module HsModuleId
-    file HsFileId
-    nameStr String
-    nameLocation HsSourceLocId
-    definedAt HsSourceLocId Maybe
-    deriving Show
-    deriving Eq
-    deriving Ord
-    UniqueName nameLocation
-HsModule
-    moduleName String
-    deriving Show
-    deriving Eq
-    deriving Ord
-    UniqueModule moduleName
-HsImport
-    importer HsModuleId
-    imported HsModuleId
-    deriving Show
-    deriving Eq
-    deriving Ord
-    UniqueImport importer imported
-|]
+import Development.CodeCompass.Schema
 
 type Cache a = Map.Map a (Key a)
 
@@ -135,7 +99,9 @@ insert' :: (HasCallStack, PersistRecordBackend a SqlBackend, Show a) => (a -> DB
 -- TODO: the check before the insert is not always needed, might boost performance to omit
 insert' insertMethod elem
   = catch ({- do liftIO (putStrLn ("inserting" ++ (show elem))); -} lift (insertMethod elem))
-          (\e -> throwM (e :: SomeException))
+          (\e -> do liftIO $ putStrLn $ displayException e
+                    liftIO $ putStrLn $ prettyCallStack callStack
+                    throwM (e :: SomeException))
 
 type DB = ReaderT SqlBackend (NoLoggingT (ResourceT IO))
 
@@ -155,7 +121,11 @@ renamedAction (connString:_) tc gr
            sortedNames = nubBy ((==) `on` getLoc) $ sortOn getLoc names
        cleanUp (tcg_mod tc)
        evalStateT (do mod <- insertModule (tcg_mod tc)
-                      mapM_ (storeName mod) sortedNames) initState
+                      let instSections = catMaybes $ map (fmap (,Instance) . instanceSections) (concatMap group_instds $ hs_tyclds gr)
+                          contextSections = concatMap (map (,Context) . getContext) (universeBi gr :: [LHsType GhcRn])
+                          sections = instSections ++ contextSections
+                      mapM_ (storeName sections mod) sortedNames
+                  ) initState
        return (tc, gr)
 
 cleanUp :: Module -> DB ()
@@ -165,6 +135,7 @@ cleanUp mod = do
     [modKey] -> do 
       deps <- findDependent modKey
       -- order of deletions is important for foreign key consistency
+      deleteWhere [HsTagModule <-. deps]
       deleteWhere [HsNameModule <-. deps]
       deleteWhere [HsSourceLocModule <-. deps]
       deleteWhere [HsFileModule <-. deps]
@@ -185,14 +156,38 @@ insertModule m = insert' always $ HsModule (showSDocUnsafe (ppr m))
 connectDB :: HasCallStack => String -> DB a -> IO a
 connectDB connString = runSqlite (pack (drop 1 $ dropWhile (/='=') connString))
 
-storeName :: HasCallStack => Key HsModule -> Located Name -> ParseM ()
-storeName mod (L l n) 
+instanceSections :: Located (InstDecl a) -> Maybe RealSrcSpan
+instanceSections (L _ (ClsInstD _ inst)) = maybeRealSrcSpan $ findTypeFunLoc (hsib_body $ cid_poly_ty inst)
+instanceSections (L _ (DataFamInstD _ inst)) = maybeRealSrcSpan $ getLoc (feqn_tycon $ hsib_body $ dfid_eqn inst)
+instanceSections _ = Nothing
+
+findTypeFunLoc :: Located (HsType a) -> SrcSpan
+findTypeFunLoc (L _ (HsAppTy _ t _)) = findTypeFunLoc t
+findTypeFunLoc (L _ (HsOpTy _ _ (L l _) _)) = l
+findTypeFunLoc (L _ (HsParTy _ t)) = findTypeFunLoc t
+findTypeFunLoc (L l _) = l
+
+getContext :: Located (HsType a) -> [RealSrcSpan]
+getContext (L l (HsQualTy _ ctx _)) = catMaybes $ map (maybeRealSrcSpan . findTypeFunLoc) (unLoc ctx)
+getContext _ = []
+
+maybeRealSrcSpan :: SrcSpan -> Maybe RealSrcSpan
+maybeRealSrcSpan (RealSrcSpan sp) = Just sp
+maybeRealSrcSpan _ = Nothing
+
+lookupSection :: [(RealSrcSpan,Tag)] -> SrcSpan -> [Tag]
+lookupSection sections (RealSrcSpan sp) = map snd $ filter (\(s,_) -> s `containsSpan` sp) sections
+
+storeName :: HasCallStack => [(RealSrcSpan,Tag)] -> Key HsModule -> Located Name -> ParseM ()
+storeName sections mod (L l n) 
   = if isGoodSrcSpan l
     then void $ do 
            Just (myLoc, file) <- insertLoc mod l
            defLoc <- insertLoc mod (nameSrcSpan n)
            let nameStr = showSDocUnsafe (ppr n)
-           insert' always $ HsName mod file nameStr myLoc (fmap fst defLoc)
+               tags = lookupSection sections l
+           name <- insert' always $ HsName mod file nameStr myLoc (fmap fst defLoc)
+           mapM_ (\t -> insert' always $ HsTag mod name t) tags
     else return ()
 
 insertLoc :: HasCallStack => Key HsModule -> SrcSpan -> ParseM (Maybe (Key HsSourceLoc, Key HsFile))
@@ -217,14 +212,37 @@ storeTC ms tc
        mapM_ (storeImport modKey) (map (unLoc . snd) (ms_textual_imps ms))
        --liftIO $ putStrLn $ "typeCheckPlugin (rn): \n" ++ (showSDoc dflags $ ppr $ tcg_rn_decls tc)
        --liftIO $ putStrLn $ "typeCheckPlugin (tc): \n" ++ (showSDocUnsafe $ ppr $ tcg_binds tc)
-       --let names = universeBi (bagToList (tcg_binds tc))
-       --liftIO $ mapM showName names
+       let bindings = universeBi (bagToList (tcg_binds tc))
+           expressions = universeBi (bagToList (tcg_binds tc))
+           names = universeBi (bagToList (tcg_binds tc))
+       liftIO $ putStrLn "### Bindings:"
+       liftIO $ mapM (\e -> putStrLn (showSrcSpan (getLoc e) ++ ": " ++ showSDocUnsafe (ppr (e :: LHsBindLR GhcTc GhcTc)) ++ ": " ++ show (toConstr (unLoc e)))) bindings
+       liftIO $ putStrLn "### Expressions:"
+       liftIO $ mapM (\e -> putStrLn (showSrcSpan (getLoc e) ++ ": " ++ showExpr (unLoc e :: HsExpr GhcTc) ++ ": " ++ show (toConstr (unLoc e)))) expressions
+       liftIO $ putStrLn "### Names:"
+       liftIO $ mapM (\e -> putStrLn (showSrcSpan (getLoc e) ++ ": " ++ showSDocUnsafe (ppr (e :: Located Name)) ++ ": " ++ show (toConstr (unLoc e)))) names
+
        return tc
   where showName :: Id -> IO ()
         showName id = putStrLn $ (showSDocUnsafe $ ppr id) ++ ": " ++ (showSDocUnsafe $ ppr (idType id))
+
+        showSrcSpan (RealSrcSpan sp) = showSDocUnsafe (pprUserRealSpan True sp)
+        showSrcSpan _ = "-"
+
+        showExpr (HsWrap _ w e) = showSDocUnsafe (ppr e) ++ "(" ++ showWrap w ++ ")"
+        showExpr e = showSDocUnsafe (ppr e)
+
+        showWrap WpHole = "WpHole"
+        showWrap (WpCompose w1 w2) = "WpCompose (" ++ showWrap w1 ++ ") (" ++ showWrap w2 ++ ")"
+        showWrap (WpFun w1 w2 t sd) = "WpFun (" ++ showWrap w1 ++ ") (" ++ showWrap w2 ++ ") (" ++ showSDocUnsafe (ppr t) ++ ") (" ++ showSDocUnsafe sd ++ ")"
+        showWrap (WpCast coerce) = "WpCast (" ++ showSDocUnsafe (ppr coerce) ++ ")"
+        showWrap (WpEvLam var) = "WpEvLam (" ++ showSDocUnsafe (ppr var) ++ ")"
+        showWrap (WpEvApp term) = "WpEvApp (" ++ showSDocUnsafe (ppr term) ++ ")"
+        showWrap (WpTyLam tv) = "WpCast (" ++ showSDocUnsafe (ppr tv) ++ ")"
+        showWrap (WpTyApp t) = "WpTyApp (" ++ showSDocUnsafe (ppr t) ++ ")"
+        showWrap (WpLet binds) = "WpLet (" ++ showSDocUnsafe (ppr binds) ++ ")"
 
 storeImport :: HasCallStack => Key HsModule -> ModuleName -> ParseM ()
 storeImport importer modName = void $ do
   imported <- insertWithCache ifNotExist psModules (HsModule $ showSDocUnsafe $ ppr modName)
   void $ insertWithCache always psImports (HsImport importer imported)
-
