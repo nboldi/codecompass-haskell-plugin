@@ -25,6 +25,8 @@ import HsExpr
 import HsImpExp
 import Name
 import Id
+import IdInfo
+import Var (varName)
 import Bag
 import SrcLoc
 import FastString
@@ -34,6 +36,9 @@ import Outputable
 import HsExpr
 import HsDoc
 import HsTypes
+import InstEnv
+import qualified CoreSyn as Core (Expr)
+import CoreSyn as Core
 
 import Data.Maybe
 import Data.Data (toConstr)
@@ -135,6 +140,7 @@ cleanUp mod = do
     [modKey] -> do 
       deps <- findDependent modKey
       -- order of deletions is important for foreign key consistency
+      deleteWhere [HsInstanceInvokationModule <-. deps]
       deleteWhere [HsTagModule <-. deps]
       deleteWhere [HsNameModule <-. deps]
       deleteWhere [HsSourceLocModule <-. deps]
@@ -212,35 +218,81 @@ storeTC ms tc
        mapM_ (storeImport modKey) (map (unLoc . snd) (ms_textual_imps ms))
        --liftIO $ putStrLn $ "typeCheckPlugin (rn): \n" ++ (showSDoc dflags $ ppr $ tcg_rn_decls tc)
        --liftIO $ putStrLn $ "typeCheckPlugin (tc): \n" ++ (showSDocUnsafe $ ppr $ tcg_binds tc)
-       let bindings = universeBi (bagToList (tcg_binds tc))
-           expressions = universeBi (bagToList (tcg_binds tc))
-           names = universeBi (bagToList (tcg_binds tc))
-       liftIO $ putStrLn "### Bindings:"
-       liftIO $ mapM (\e -> putStrLn (showSrcSpan (getLoc e) ++ ": " ++ showSDocUnsafe (ppr (e :: LHsBindLR GhcTc GhcTc)) ++ ": " ++ show (toConstr (unLoc e)))) bindings
+       let --bindings = universeBi (bagToList (tcg_binds tc))
+           expressions = filter (isGoodSrcSpan . getLoc) $ universeBi (bagToList (tcg_binds tc))
+           --names = universeBi (bagToList (tcg_binds tc))
+           instances = (tcg_insts tc)
+       -- liftIO $ putStrLn "### Bindings:"
+       -- liftIO $ mapM (\e -> putStrLn (showSrcSpan (getLoc e) ++ ": " ++ showSDocUnsafe (ppr (e :: LHsBindLR GhcTc GhcTc)) ++ ": " ++ show (toConstr (unLoc e)))) bindings
        liftIO $ putStrLn "### Expressions:"
-       liftIO $ mapM (\e -> putStrLn (showSrcSpan (getLoc e) ++ ": " ++ showExpr (unLoc e :: HsExpr GhcTc) ++ ": " ++ show (toConstr (unLoc e)))) expressions
-       liftIO $ putStrLn "### Names:"
-       liftIO $ mapM (\e -> putStrLn (showSrcSpan (getLoc e) ++ ": " ++ showSDocUnsafe (ppr (e :: Located Name)) ++ ": " ++ show (toConstr (unLoc e)))) names
+       liftIO $ mapM (\e -> putStrLn (showSrcSpan (getLoc e) ++ ": " ++ showExpr (unLoc e :: HsExpr GhcTc) ++ ": " ++ show (exprInstanceBind (tcg_ev_binds tc) e))) expressions
+       mapM (storeInstanceInvokation modKey) $ catMaybes
+         $ map (exprInstanceBind (tcg_ev_binds tc)) expressions
+       -- liftIO $ putStrLn "### Names:"
+       -- liftIO $ mapM (\e -> putStrLn (showSrcSpan (getLoc e) ++ ": " ++ showSDocUnsafe (ppr (e :: Located Name)) ++ ": " ++ show (toConstr (unLoc e)))) names
+       liftIO $ putStrLn "### Instances:"
+       liftIO $ mapM (\i -> putStrLn (showSDocUnsafe (ppr i) ++ " -- " ++ showSDocUnsafe (ppr (is_dfun_name i)) ++ " -- " ++ showSrcSpan (nameSrcSpan (is_dfun_name i)))) instances
+       liftIO $ putStrLn "### EV binds:"
+       liftIO $ putStrLn $ showSDocUnsafe $ ppr (tcg_ev_binds tc)
+       liftIO $ mapM (\e -> putStrLn $ showSDocUnsafe (ppr (eb_lhs e)) ++ " --> " ++ showTerm (eb_rhs e))
+                     (bagToList $ tcg_ev_binds tc)
+
 
        return tc
-  where showName :: Id -> IO ()
+  where 
+        exprInstanceBind :: Bag EvBind -> LHsExpr GhcTc -> Maybe (SrcSpan, SrcSpan)
+        exprInstanceBind evBinds (L l (HsWrap _ w _))
+          | Just (Var id) <- wrapEvApp w
+          , EvBind { eb_rhs = EvExpr (Var dictId) } : _ <- bagToList (filterBag (\ev -> eb_lhs ev == id) evBinds)
+          = Just (l, nameSrcSpan (Var.varName dictId))
+        exprInstanceBind _ _ = Nothing
+
+        wrapEvApp :: HsWrapper -> Maybe EvExpr
+        wrapEvApp (WpCompose w1 w2) = wrapEvApp w1 <|> wrapEvApp w2
+        wrapEvApp (WpEvApp (EvExpr expr)) = Just expr
+        wrapEvApp _ = Nothing
+
+        storeInstanceInvokation :: Key HsModule -> (SrcSpan, SrcSpan) -> ParseM ()
+        storeInstanceInvokation modKey (from,to) = do
+            fromLoc <- insertLoc modKey from
+            toLoc <- insertLoc modKey to
+            case (fromLoc, toLoc) of
+              (Just (fromKey, _), Just (toKey, _)) -> void $ insert' always (HsInstanceInvokation modKey fromKey toKey)
+              _                                    -> return ()
+            
+
+        showName :: Id -> IO ()
         showName id = putStrLn $ (showSDocUnsafe $ ppr id) ++ ": " ++ (showSDocUnsafe $ ppr (idType id))
 
         showSrcSpan (RealSrcSpan sp) = showSDocUnsafe (pprUserRealSpan True sp)
-        showSrcSpan _ = "-"
+        showSrcSpan _ = "??SPAN??"
 
         showExpr (HsWrap _ w e) = showSDocUnsafe (ppr e) ++ "(" ++ showWrap w ++ ")"
         showExpr e = showSDocUnsafe (ppr e)
+
+        -- getInstanceInvocation :: LHsExpr GhcTc -> Maybe (SrcSpan, SrcSpan)
+        -- getInstanceInvocation (L l (HsWrap _ w _)) 
+        --   | isGoodSrcSpan l, Just  = 
 
         showWrap WpHole = "WpHole"
         showWrap (WpCompose w1 w2) = "WpCompose (" ++ showWrap w1 ++ ") (" ++ showWrap w2 ++ ")"
         showWrap (WpFun w1 w2 t sd) = "WpFun (" ++ showWrap w1 ++ ") (" ++ showWrap w2 ++ ") (" ++ showSDocUnsafe (ppr t) ++ ") (" ++ showSDocUnsafe sd ++ ")"
         showWrap (WpCast coerce) = "WpCast (" ++ showSDocUnsafe (ppr coerce) ++ ")"
         showWrap (WpEvLam var) = "WpEvLam (" ++ showSDocUnsafe (ppr var) ++ ")"
-        showWrap (WpEvApp term) = "WpEvApp (" ++ showSDocUnsafe (ppr term) ++ ")"
+        showWrap (WpEvApp term) = "WpEvApp (" ++ showTerm term ++ ")"
         showWrap (WpTyLam tv) = "WpCast (" ++ showSDocUnsafe (ppr tv) ++ ")"
         showWrap (WpTyApp t) = "WpTyApp (" ++ showSDocUnsafe (ppr t) ++ ")"
         showWrap (WpLet binds) = "WpLet (" ++ showSDocUnsafe (ppr binds) ++ ")"
+
+        showTerm (EvExpr expr) = "EvExpr (" ++ exprVars expr ++ ")"
+        showTerm (EvTypeable typ typeable) = "EvTypeable (" ++ showSDocUnsafe (ppr typ) ++ ") (" ++ showSDocUnsafe (ppr typeable) ++ ")"
+        showTerm (EvFun tvs given binds body) = "EvFun (" ++ showSDocUnsafe (ppr tvs) ++ ") (" ++ showSDocUnsafe (ppr given)  ++ ") (" ++ showSDocUnsafe (ppr binds) ++ ") (" ++ showSDocUnsafe (ppr body) ++ ")"
+
+        exprVars :: Core.Expr CoreBndr -> String
+        exprVars (Var id) = showSDocUnsafe (ppr id) ++ ": " ++ showSrcSpan (nameSrcSpan $ (Var.varName id))
+        exprVars (Cast e _) = "Cast+" ++ exprVars e
+        exprVars (Tick _ e) = "Tick+" ++ exprVars e
+        exprVars e = showSDocUnsafe (ppr e) ++ ": ??"
 
 storeImport :: HasCallStack => Key HsModule -> ModuleName -> ParseM ()
 storeImport importer modName = void $ do

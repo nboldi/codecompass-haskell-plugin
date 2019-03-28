@@ -64,4 +64,12 @@ HsTag
     deriving Eq
     deriving Ord
     UniqueTag name tag
+HsInstanceInvokation
+    module HsModuleId
+    location HsSourceLocId
+    invoked HsSourceLocId
+    deriving Show
+    deriving Eq
+    deriving Ord
+    UniqueInstanceInvokation location
 |]
