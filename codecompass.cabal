@@ -55,6 +55,7 @@ library
   -- Modules exported by the library.
   exposed-modules:
     Development.CodeCompass.Parser.Plugin
+    Development.CodeCompass.Parser.Names
     Development.CodeCompass.Schema
 
   -- Modules included in this library but not exported.

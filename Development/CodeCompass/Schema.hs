@@ -72,4 +72,11 @@ HsInstanceInvokation
     deriving Eq
     deriving Ord
     UniqueInstanceInvokation location
+HsComment
+    module HsModuleId
+    element HsSourceLocId
+    comment String
+    deriving Show
+    deriving Eq
+    deriving Ord
 |]

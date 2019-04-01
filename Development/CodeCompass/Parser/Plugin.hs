@@ -12,9 +12,9 @@
 {-# LANGUAGE RankNTypes                 #-}
 {-# LANGUAGE UndecidableInstances       #-}
 {-# LANGUAGE TupleSections              #-}
+{-# LANGUAGE ViewPatterns               #-}
 module Development.CodeCompass.Parser.Plugin where
 
-import DynFlags (getDynFlags)
 import Plugins
 import HscTypes
 import TcRnTypes
@@ -33,16 +33,25 @@ import FastString
 import Module
 import Avail
 import Outputable
+import DynFlags
+import StringBuffer
 import HsExpr
 import HsDoc
+import Parser
+import ApiAnnotation
+import Lexer
 import HsTypes
 import InstEnv
 import qualified CoreSyn as Core (Expr)
 import CoreSyn as Core
+import HsSyn hiding (HsModule)
+import RdrName
+import HscTypes
 
+import Data.Char (isSpace)
 import Data.Maybe
 import Data.Data (toConstr)
-import Data.List (nubBy, sortOn, find)
+import Data.List (nubBy, sortOn, find, isPrefixOf, minimumBy, maximumBy)
 import Data.Function
 import qualified Data.Map as Map
 import Data.Generics.Uniplate.Operations
@@ -52,7 +61,7 @@ import Control.Monad
 import Control.Monad.Catch
 import Control.Monad.State
 import Control.Monad.IO.Unlift
-import Data.Text hiding (drop, dropWhile, filter, length, map, concatMap, concat, find)
+import Data.Text (pack)
 import Control.Monad.Reader
 import Control.Monad.Logger
 import Conduit
@@ -64,7 +73,8 @@ import Control.Lens hiding (Context(..), element)
 import GHC.Stack
 import TcEvidence
 
-import Development.CodeCompass.Schema
+import Development.CodeCompass.Schema as Schema
+import Development.CodeCompass.Parser.Names
 
 type Cache a = Map.Map a (Key a)
 
@@ -78,8 +88,8 @@ makeLenses ''ParseState
 
 plugin :: Plugin
 plugin = defaultPlugin {
-    -- parsedResultAction = parsed
-  typeCheckResultAction = typecheckPlugin
+  parsedResultAction = parsedAction
+  , typeCheckResultAction = typecheckPlugin
   -- , spliceRunAction = spliceRun
   -- , interfaceLoadAction = interfaceLoad
   , renamedResultAction = renamedAction
@@ -115,17 +125,85 @@ type ParseM = StateT ParseState DB
 initState :: ParseState
 initState = PS Map.empty Map.empty Map.empty Map.empty
 
+
+parsedAction :: HasCallStack => [CommandLineOption] -> ModSummary -> HsParsedModule -> Hsc HsParsedModule
+parsedAction [] _ _
+  = error "CodeCompass plugin needs a connection string to a database to store the data."
+parsedAction (connString:_) ms parse
+  = liftIO $ connectDB connString $ do 
+      cleanUp (ms_mod ms)
+      flip evalStateT initState $ do
+        mod <- insertModule (ms_mod ms)
+        comments <- liftIO $ parseForComments ms
+        let withAttach = commentAttach comments
+            attachable = hsGetNames noSrcSpan $ hsmodDecls $ unLoc $ hpm_module parse
+        mapM (attach mod attachable) withAttach
+        return parse
+
+attach :: Key HsModule -> [(Located RdrName, SrcSpan)] -> Located (AnnotationComment, AttachRule) -> ParseM ()
+attach mod elements (L commLoc (comm, attach)) 
+  = case filter (attachCondition . snd) elements of
+      [] -> return ()
+      elems -> do Just (location,_) <- insertLoc mod (getLoc $ fst $ attachSelect elems)
+                  void $ insert' always $ HsComment mod location (getCommentString comm)
+  where attachCondition = case attach of AttachNext -> (srcSpanEnd commLoc <) . srcSpanStart
+                                         AttachPrevious -> (srcSpanStart commLoc >) . srcSpanEnd
+        attachSelect = case attach of AttachNext -> minimumBy (compare `on` (srcSpanStart . snd))
+                                      AttachPrevious -> maximumBy (compare `on` (srcSpanEnd . snd))
+
+commentAttach :: [Located AnnotationComment] -> [Located (AnnotationComment, AttachRule)]
+commentAttach = catMaybes . map (\(L l e) -> fmap (L l) $ categorizeComment e) . foldr joinComments []
+  where joinComments :: (Located AnnotationComment) -> [Located AnnotationComment] -> [Located AnnotationComment]
+        joinComments (L sp1@(RealSrcSpan (srcSpanStartLine -> r1)) (AnnLineComment str1))
+                     (L sp2@(RealSrcSpan (srcSpanStartLine -> r2)) (AnnLineComment str2) : ls) 
+          | abs (r1 - r2) <= 1
+          , not $ "|" `isPrefixOf` dropWhile isSpace (drop 2 str2)
+          , not $ "^" `isPrefixOf` dropWhile isSpace (drop 2 str2)
+          = L (combineSrcSpans sp2 sp1) (AnnLineComment (str2 ++ "\n" ++ str1)) : ls
+        joinComments comm [] = [comm]
+        joinComments comm ls = comm : ls
+
+getCommentString :: AnnotationComment -> String
+getCommentString (AnnLineComment str) = str
+getCommentString (AnnBlockComment str) = str
+
+data AttachRule = AttachNext | AttachPrevious
+  deriving Show
+
+instance Outputable AttachRule where
+  ppr = text . show
+
+categorizeComment :: AnnotationComment -> Maybe (AnnotationComment, AttachRule)
+categorizeComment comm@(AnnLineComment str) 
+  | "|" `isPrefixOf` dropWhile isSpace (drop 2 str) =  Just (comm, AttachNext)
+categorizeComment comm@(AnnLineComment str) 
+  | "^" `isPrefixOf` dropWhile isSpace (drop 2 str) =  Just (comm, AttachPrevious)
+categorizeComment comm@(AnnBlockComment str) 
+  | "|" `isPrefixOf` dropWhile isSpace (drop 2 str) =  Just (comm, AttachNext)
+categorizeComment comm@(AnnBlockComment str) 
+  | "^" `isPrefixOf` dropWhile isSpace (drop 2 str) =  Just (comm, AttachPrevious)
+categorizeComment _ = Nothing
+
+parseForComments :: ModSummary -> IO [Located AnnotationComment]
+parseForComments ms = do
+  let dflags = ms_hspp_opts ms
+      dflags' = gopt_set dflags Opt_KeepRawTokenStream
+      file = msHsFilePath ms
+      location = mkRealSrcLoc (mkFastString file) 1 1
+  buffer <- hGetStringBuffer file
+  let parseState = mkPState dflags' buffer location
+  case unP parseModule parseState of
+    POk st _ -> return (comment_q st ++ concatMap snd (annotations_comments st))
+    PFailed _ _ _ -> return []
+
 renamedAction :: HasCallStack => [CommandLineOption]
                     -> TcGblEnv -> HsGroup GhcRn
                     -> TcM (TcGblEnv, HsGroup GhcRn)
-renamedAction [] _ _
-  = error "CodeCompass plugin needs a connection string to a database to store the data."
 renamedAction (connString:_) tc gr
   = liftIO $ connectDB connString $ do
        let names = universeBi gr
            sortedNames = nubBy ((==) `on` getLoc) $ sortOn getLoc names
-       cleanUp (tcg_mod tc)
-       evalStateT (do mod <- insertModule (tcg_mod tc)
+       evalStateT (do [mod] <- lift $ selectKeysList [HsModuleModuleName ==. showSDocUnsafe (ppr (tcg_mod tc))] []
                       let instSections = catMaybes $ map (fmap (,Instance) . instanceSections) (concatMap group_instds $ hs_tyclds gr)
                           contextSections = concatMap (map (,Context) . getContext) (universeBi gr :: [LHsType GhcRn])
                           sections = instSections ++ contextSections
@@ -139,7 +217,7 @@ cleanUp mod = do
   case m of
     [modKey] -> do 
       deps <- findDependent modKey
-      -- order of deletions is important for foreign key consistency
+      deleteWhere [HsCommentModule <-. deps]
       deleteWhere [HsInstanceInvokationModule <-. deps]
       deleteWhere [HsTagModule <-. deps]
       deleteWhere [HsNameModule <-. deps]
@@ -156,7 +234,7 @@ findDependent m = do
   furtherKeys <- mapM findDependent (map (hsImportImporter . entityVal) newKeys)
   return (m : concat furtherKeys) 
 
-insertModule :: Module -> ParseM (Key HsModule)
+insertModule :: HasCallStack => Module -> ParseM (Key HsModule)
 insertModule m = insert' always $ HsModule (showSDocUnsafe (ppr m))     
 
 connectDB :: HasCallStack => String -> DB a -> IO a
@@ -216,28 +294,9 @@ storeTC :: HasCallStack => ModSummary -> TcGblEnv -> ParseM TcGblEnv
 storeTC ms tc 
   = do [modKey] <- lift $ selectKeysList [HsModuleModuleName ==. showSDocUnsafe (ppr (ms_mod ms))] []
        mapM_ (storeImport modKey) (map (unLoc . snd) (ms_textual_imps ms))
-       --liftIO $ putStrLn $ "typeCheckPlugin (rn): \n" ++ (showSDoc dflags $ ppr $ tcg_rn_decls tc)
-       --liftIO $ putStrLn $ "typeCheckPlugin (tc): \n" ++ (showSDocUnsafe $ ppr $ tcg_binds tc)
-       let --bindings = universeBi (bagToList (tcg_binds tc))
-           expressions = filter (isGoodSrcSpan . getLoc) $ universeBi (bagToList (tcg_binds tc))
-           --names = universeBi (bagToList (tcg_binds tc))
-           instances = (tcg_insts tc)
-       -- liftIO $ putStrLn "### Bindings:"
-       -- liftIO $ mapM (\e -> putStrLn (showSrcSpan (getLoc e) ++ ": " ++ showSDocUnsafe (ppr (e :: LHsBindLR GhcTc GhcTc)) ++ ": " ++ show (toConstr (unLoc e)))) bindings
-       liftIO $ putStrLn "### Expressions:"
-       liftIO $ mapM (\e -> putStrLn (showSrcSpan (getLoc e) ++ ": " ++ showExpr (unLoc e :: HsExpr GhcTc) ++ ": " ++ show (exprInstanceBind (tcg_ev_binds tc) e))) expressions
+       let expressions = filter (isGoodSrcSpan . getLoc) $ universeBi (bagToList (tcg_binds tc))
        mapM (storeInstanceInvokation modKey) $ catMaybes
          $ map (exprInstanceBind (tcg_ev_binds tc)) expressions
-       -- liftIO $ putStrLn "### Names:"
-       -- liftIO $ mapM (\e -> putStrLn (showSrcSpan (getLoc e) ++ ": " ++ showSDocUnsafe (ppr (e :: Located Name)) ++ ": " ++ show (toConstr (unLoc e)))) names
-       liftIO $ putStrLn "### Instances:"
-       liftIO $ mapM (\i -> putStrLn (showSDocUnsafe (ppr i) ++ " -- " ++ showSDocUnsafe (ppr (is_dfun_name i)) ++ " -- " ++ showSrcSpan (nameSrcSpan (is_dfun_name i)))) instances
-       liftIO $ putStrLn "### EV binds:"
-       liftIO $ putStrLn $ showSDocUnsafe $ ppr (tcg_ev_binds tc)
-       liftIO $ mapM (\e -> putStrLn $ showSDocUnsafe (ppr (eb_lhs e)) ++ " --> " ++ showTerm (eb_rhs e))
-                     (bagToList $ tcg_ev_binds tc)
-
-
        return tc
   where 
         exprInstanceBind :: Bag EvBind -> LHsExpr GhcTc -> Maybe (SrcSpan, SrcSpan)
@@ -252,47 +311,13 @@ storeTC ms tc
         wrapEvApp (WpEvApp (EvExpr expr)) = Just expr
         wrapEvApp _ = Nothing
 
-        storeInstanceInvokation :: Key HsModule -> (SrcSpan, SrcSpan) -> ParseM ()
-        storeInstanceInvokation modKey (from,to) = do
-            fromLoc <- insertLoc modKey from
-            toLoc <- insertLoc modKey to
-            case (fromLoc, toLoc) of
-              (Just (fromKey, _), Just (toKey, _)) -> void $ insert' always (HsInstanceInvokation modKey fromKey toKey)
-              _                                    -> return ()
-            
-
-        showName :: Id -> IO ()
-        showName id = putStrLn $ (showSDocUnsafe $ ppr id) ++ ": " ++ (showSDocUnsafe $ ppr (idType id))
-
-        showSrcSpan (RealSrcSpan sp) = showSDocUnsafe (pprUserRealSpan True sp)
-        showSrcSpan _ = "??SPAN??"
-
-        showExpr (HsWrap _ w e) = showSDocUnsafe (ppr e) ++ "(" ++ showWrap w ++ ")"
-        showExpr e = showSDocUnsafe (ppr e)
-
-        -- getInstanceInvocation :: LHsExpr GhcTc -> Maybe (SrcSpan, SrcSpan)
-        -- getInstanceInvocation (L l (HsWrap _ w _)) 
-        --   | isGoodSrcSpan l, Just  = 
-
-        showWrap WpHole = "WpHole"
-        showWrap (WpCompose w1 w2) = "WpCompose (" ++ showWrap w1 ++ ") (" ++ showWrap w2 ++ ")"
-        showWrap (WpFun w1 w2 t sd) = "WpFun (" ++ showWrap w1 ++ ") (" ++ showWrap w2 ++ ") (" ++ showSDocUnsafe (ppr t) ++ ") (" ++ showSDocUnsafe sd ++ ")"
-        showWrap (WpCast coerce) = "WpCast (" ++ showSDocUnsafe (ppr coerce) ++ ")"
-        showWrap (WpEvLam var) = "WpEvLam (" ++ showSDocUnsafe (ppr var) ++ ")"
-        showWrap (WpEvApp term) = "WpEvApp (" ++ showTerm term ++ ")"
-        showWrap (WpTyLam tv) = "WpCast (" ++ showSDocUnsafe (ppr tv) ++ ")"
-        showWrap (WpTyApp t) = "WpTyApp (" ++ showSDocUnsafe (ppr t) ++ ")"
-        showWrap (WpLet binds) = "WpLet (" ++ showSDocUnsafe (ppr binds) ++ ")"
-
-        showTerm (EvExpr expr) = "EvExpr (" ++ exprVars expr ++ ")"
-        showTerm (EvTypeable typ typeable) = "EvTypeable (" ++ showSDocUnsafe (ppr typ) ++ ") (" ++ showSDocUnsafe (ppr typeable) ++ ")"
-        showTerm (EvFun tvs given binds body) = "EvFun (" ++ showSDocUnsafe (ppr tvs) ++ ") (" ++ showSDocUnsafe (ppr given)  ++ ") (" ++ showSDocUnsafe (ppr binds) ++ ") (" ++ showSDocUnsafe (ppr body) ++ ")"
-
-        exprVars :: Core.Expr CoreBndr -> String
-        exprVars (Var id) = showSDocUnsafe (ppr id) ++ ": " ++ showSrcSpan (nameSrcSpan $ (Var.varName id))
-        exprVars (Cast e _) = "Cast+" ++ exprVars e
-        exprVars (Tick _ e) = "Tick+" ++ exprVars e
-        exprVars e = showSDocUnsafe (ppr e) ++ ": ??"
+storeInstanceInvokation :: Key HsModule -> (SrcSpan, SrcSpan) -> ParseM ()
+storeInstanceInvokation modKey (from,to) = do
+    fromLoc <- insertLoc modKey from
+    toLoc <- insertLoc modKey to
+    case (fromLoc, toLoc) of
+      (Just (fromKey, _), Just (toKey, _)) -> void $ insert' always (HsInstanceInvokation modKey fromKey toKey)
+      _                                    -> return ()
 
 storeImport :: HasCallStack => Key HsModule -> ModuleName -> ParseM ()
 storeImport importer modName = void $ do
