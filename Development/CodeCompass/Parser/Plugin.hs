@@ -137,18 +137,32 @@ parsedAction (connString:_) ms parse
   = liftIO $ connectDB connString $ do 
       cleanUp (ms_mod ms)
       flip evalStateT initState $ do
-        mod <- insertModule (ms_mod ms)
+        mod <- insertModule (ms_mod ms) (hsmodName (unLoc $ hpm_module parse))
         comments <- liftIO $ parseForComments ms
         let withAttach = commentAttach comments
-            attachable = hsGetNames noSrcSpan $ hsmodDecls $ unLoc $ hpm_module parse
+            moduleItself = (\n -> (getLoc n, getLoc n)) <$> hsmodName (unLoc $ hpm_module parse)
+            attachableNames = map (\(n,sp) -> (getLoc n, sp)) $ hsGetNames noSrcSpan 
+                           $ hsmodDecls $ unLoc $ hpm_module parse
+            attachable = catMaybes [moduleItself] ++ attachableNames
         mapM (attach mod attachable) withAttach
+        mapM (storeModuleName mod) (universeBi (hpm_module parse))
         return parse
 
-attach :: Key HsModule -> [(Located RdrName, SrcSpan)] -> Located (AnnotationComment, AttachRule) -> ParseM ()
+storeModuleName :: Key HsModule -> Located ModuleName -> ParseM ()
+storeModuleName mod (L l modName) = do 
+  store <- insertLoc mod l
+  findMod <- lift $ selectList [HsModuleModuleName ==. moduleNameString modName] []
+  case (store, findMod) of
+    (Just (loc, _), (entityVal -> HsModule _ modNameLoc):_) 
+      -> void $ insert' always $ HsName mod (moduleNameString modName) loc modNameLoc Nothing
+    _ -> return ()
+  
+
+attach :: Key HsModule -> [(SrcSpan, SrcSpan)] -> Located (AnnotationComment, AttachRule) -> ParseM ()
 attach mod elements (L commLoc (comm, attach)) 
   = case filter (attachCondition . snd) elements of
       [] -> return ()
-      elems -> do locs <- mapM (insertLoc mod . getLoc . fst) (attachSelect elems)
+      elems -> do locs <- mapM (insertLoc mod . fst) (attachSelect elems)
                   void $ mapM (insert' always) (map (\(l,_) -> HsComment mod l (getCommentString comm)) (catMaybes locs))
   where attachCondition = case attach of AttachNext -> (srcSpanEnd commLoc <) . srcSpanStart
                                          AttachPrevious -> (srcSpanStart commLoc >) . srcSpanEnd
@@ -206,7 +220,8 @@ renamedAction :: HasCallStack => [CommandLineOption]
 renamedAction (connString:_) tc gr
   = liftIO $ connectDB connString $ do
        let names = universeBi gr
-           sortedNames = nubBy ((==) `on` getLoc) $ sortOn getLoc names
+           lieNames = universeBi (tcg_rn_exports tc) ++ universeBi (tcg_rn_imports tc) :: [Located Name]
+           sortedNames = nubBy ((==) `on` getLoc) $ filter (isGoodSrcSpan . getLoc) $ sortOn getLoc (names ++ lieNames)
        evalStateT (do [mod] <- lift $ selectKeysList [HsModuleModuleName ==. showSDocUnsafe (ppr (tcg_mod tc))] []
                       let instSections = catMaybes $ map (fmap (,Instance) . instanceSections) (concatMap group_instds $ hs_tyclds gr)
                           contextSections = concatMap (map (,Context) . getContext) (universeBi gr :: [LHsType GhcRn])
@@ -238,8 +253,14 @@ findDependent m = do
   furtherKeys <- mapM findDependent (map (hsImportImporter . entityVal) newKeys)
   return (m : concat furtherKeys) 
 
-insertModule :: HasCallStack => Module -> ParseM (Key HsModule)
-insertModule m = insert' always $ HsModule (showSDocUnsafe (ppr m))     
+insertModule :: HasCallStack => Module -> Maybe (Located ModuleName) -> ParseM (Key HsModule)
+insertModule m Nothing = insert' always $ HsModule (showSDocUnsafe (ppr m)) Nothing
+insertModule m (Just name) = do 
+  modKey <- insert' always $ HsModule (showSDocUnsafe (ppr m)) Nothing
+  loc <- insertLoc modKey (getLoc name)
+  case loc of Just (l,_) -> lift $ update modKey [HsModuleModNameLoc =. Just l]
+              Nothing -> return ()
+  return modKey
 
 connectDB :: HasCallStack => String -> DB a -> IO a
 connectDB connString = runSqlite (pack (drop 1 $ dropWhile (/='=') connString))
@@ -270,11 +291,11 @@ storeName :: HasCallStack => [(RealSrcSpan,Tag)] -> Key HsModule -> Located Name
 storeName sections mod (L l n) 
   = if isGoodSrcSpan l
     then void $ do 
-           Just (myLoc, file) <- insertLoc mod l
+           Just (myLoc, _) <- insertLoc mod l
            defLoc <- insertLoc mod (nameSrcSpan n)
            let nameStr = showSDocUnsafe (ppr n)
                tags = lookupSection sections l
-           name <- insert' always $ HsName mod file nameStr myLoc (fmap fst defLoc) Nothing
+           name <- insert' always $ HsName mod nameStr myLoc (fmap fst defLoc) Nothing
            mapM_ (\t -> insert' ifNotExist $ HsTag mod name t) tags
     else return ()
 
@@ -325,7 +346,6 @@ storeTC ms tc
         updateNameType :: Key HsModule -> Located Id -> ParseM ()
         updateNameType mod (L sp id)
           = do loc <- insertLoc mod sp
-               liftIO $ putStrLn $ "Inserting type: " ++ show sp ++ ": " ++ (showSDocUnsafe (ppr (varType id)))
                case loc of Just (l,_) -> lift $ updateWhere
                                            [HsNameNameLocation ==. l]
                                            [HsNameType =. Just (showSDocUnsafe (ppr (varType id)))]
@@ -346,5 +366,5 @@ storeInstanceInvokation modKey (from,to) = do
 
 storeImport :: HasCallStack => Key HsModule -> ModuleName -> ParseM ()
 storeImport importer modName = void $ do
-  imported <- insertWithCache ifNotExist psModules (HsModule $ showSDocUnsafe $ ppr modName)
+  imported <- insertWithCache ifNotExist psModules (HsModule (showSDocUnsafe $ ppr modName) Nothing)
   void $ insertWithCache always psImports (HsImport importer imported)

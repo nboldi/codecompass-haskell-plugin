@@ -35,7 +35,6 @@ HsSourceLoc
     UniqueSourceLoc file startRow startCol
 HsName
     module HsModuleId
-    file HsFileId
     nameStr String
     nameLocation HsSourceLocId
     definedAt HsSourceLocId Maybe
@@ -46,6 +45,7 @@ HsName
     UniqueName nameLocation
 HsModule
     moduleName String
+    modNameLoc HsSourceLocId Maybe
     deriving Show
     deriving Eq
     deriving Ord
