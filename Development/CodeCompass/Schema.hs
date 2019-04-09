@@ -39,6 +39,7 @@ HsName
     nameLocation HsSourceLocId
     definedAt HsSourceLocId Maybe
     type String Maybe
+    concreteType String Maybe
     deriving Show
     deriving Eq
     deriving Ord

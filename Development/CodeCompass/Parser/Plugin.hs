@@ -50,6 +50,7 @@ import HscTypes
 import UniqFM
 import Unique
 import NameEnv
+import Type
 
 import Data.Char (isSpace)
 import Data.Maybe
@@ -154,7 +155,7 @@ storeModuleName mod (L l modName) = do
   findMod <- lift $ selectList [HsModuleModuleName ==. moduleNameString modName] []
   case (store, findMod) of
     (Just (loc, _), (entityVal -> HsModule _ modNameLoc):_) 
-      -> void $ insert' always $ HsName mod (moduleNameString modName) loc modNameLoc Nothing
+      -> void $ insert' always $ HsName mod (moduleNameString modName) loc modNameLoc Nothing Nothing
     _ -> return ()
   
 
@@ -236,6 +237,8 @@ cleanUp mod = do
   case m of
     [modKey] -> do 
       deps <- findDependent modKey
+       -- remove circular dependency
+      mapM (\m -> update m [ HsModuleModNameLoc =. Nothing ]) deps
       deleteWhere [HsCommentModule <-. deps]
       deleteWhere [HsInstanceInvokationModule <-. deps]
       deleteWhere [HsTagModule <-. deps]
@@ -295,7 +298,7 @@ storeName sections mod (L l n)
            defLoc <- insertLoc mod (nameSrcSpan n)
            let nameStr = showSDocUnsafe (ppr n)
                tags = lookupSection sections l
-           name <- insert' always $ HsName mod nameStr myLoc (fmap fst defLoc) Nothing
+           name <- insert' always $ HsName mod nameStr myLoc (fmap fst defLoc) Nothing Nothing
            mapM_ (\t -> insert' ifNotExist $ HsTag mod name t) tags
     else return ()
 
@@ -326,9 +329,12 @@ storeTC ms tc
        -- TODO: why doesn't uniplate work on bags and how can this be fixed
        let expressions = filter (isGoodSrcSpan . getLoc) $ universeBi $ bagToList (tcg_binds tc)
            names = universeBi (bagToList (tcg_binds tc))
+           implicitTypeArgs = catMaybes (map exprTypeApps expressions)
        mapM (storeInstanceInvokation modKey) $ catMaybes
          $ map (exprInstanceBind (tcg_ev_binds tc)) expressions
-       mapM_ (updateNameType modKey) (names ++ catMaybes (map exprName expressions))
+       mapM_ (updateNameType modKey implicitTypeArgs) (names ++ catMaybes (map exprName expressions))
+
+       liftIO $ putStrLn $ showSDocUnsafe $ ppr implicitTypeArgs
        return tc
   where 
         exprInstanceBind :: Bag EvBind -> LHsExpr GhcTc -> Maybe (SrcSpan, SrcSpan)
@@ -338,17 +344,35 @@ storeTC ms tc
           = Just (l, nameSrcSpan (Var.varName dictId))
         exprInstanceBind _ _ = Nothing
 
+        exprTypeApps :: LHsExpr GhcTc -> Maybe (SrcSpan, [Type])
+        exprTypeApps (L l (HsWrap _ w _))
+          = case wrapTyApp w of [] -> Nothing
+                                tys -> Just (l, tys)
+        exprTypeApps _ = Nothing
+
         wrapEvApp :: HsWrapper -> Maybe EvExpr
         wrapEvApp (WpCompose w1 w2) = wrapEvApp w1 <|> wrapEvApp w2
         wrapEvApp (WpEvApp (EvExpr expr)) = Just expr
         wrapEvApp _ = Nothing
 
-        updateNameType :: Key HsModule -> Located Id -> ParseM ()
-        updateNameType mod (L sp id)
+        wrapTyApp :: HsWrapper -> [Type]
+        wrapTyApp (WpCompose w1 w2) = wrapTyApp w1 ++ wrapTyApp w2
+        wrapTyApp (WpTyApp t) = [t]
+        wrapTyApp _ = []
+
+        updateNameType :: Key HsModule -> [(SrcSpan, [Type])] -> Located Id -> ParseM ()
+        updateNameType mod typeArgs (L sp var)
           = do loc <- insertLoc mod sp
+               let nameType = varType var
+                   actualArgs = lookup sp typeArgs
+                   numArgs = length $ fst $ splitForAllTys (varType var)
+                   concretiseType :: Type -> Type
+                   concretiseType t = maybe t (\args -> if length args <= numArgs then piResultTys t args else t) actualArgs
                case loc of Just (l,_) -> lift $ updateWhere
-                                           [HsNameNameLocation ==. l]
-                                           [HsNameType =. Just (showSDocUnsafe (ppr (varType id)))]
+                                           [ HsNameNameLocation ==. l ]
+                                           [ HsNameType =. Just (showSDocUnsafe (ppr nameType))
+                                           , HsNameConcreteType =. Just (showSDocUnsafe (ppr (concretiseType nameType)))
+                                           ]
                            _ -> return ()
 
         exprName :: LHsExpr GhcTc -> Maybe (Located Id)
