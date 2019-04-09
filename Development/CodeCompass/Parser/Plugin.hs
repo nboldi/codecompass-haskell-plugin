@@ -26,7 +26,7 @@ import HsImpExp
 import Name
 import Id
 import IdInfo
-import Var (varName)
+import Var (varName, varType)
 import Bag
 import SrcLoc
 import FastString
@@ -47,9 +47,13 @@ import CoreSyn as Core
 import HsSyn hiding (HsModule)
 import RdrName
 import HscTypes
+import UniqFM
+import Unique
+import NameEnv
 
 import Data.Char (isSpace)
 import Data.Maybe
+import Data.IORef
 import Data.Data (toConstr)
 import Data.List (nubBy, sortOn, find, isPrefixOf, minimumBy, maximumBy)
 import Data.Function
@@ -144,12 +148,12 @@ attach :: Key HsModule -> [(Located RdrName, SrcSpan)] -> Located (AnnotationCom
 attach mod elements (L commLoc (comm, attach)) 
   = case filter (attachCondition . snd) elements of
       [] -> return ()
-      elems -> do Just (location,_) <- insertLoc mod (getLoc $ fst $ attachSelect elems)
-                  void $ insert' always $ HsComment mod location (getCommentString comm)
+      elems -> do locs <- mapM (insertLoc mod . getLoc . fst) (attachSelect elems)
+                  void $ mapM (insert' always) (map (\(l,_) -> HsComment mod l (getCommentString comm)) (catMaybes locs))
   where attachCondition = case attach of AttachNext -> (srcSpanEnd commLoc <) . srcSpanStart
                                          AttachPrevious -> (srcSpanStart commLoc >) . srcSpanEnd
-        attachSelect = case attach of AttachNext -> minimumBy (compare `on` (srcSpanStart . snd))
-                                      AttachPrevious -> maximumBy (compare `on` (srcSpanEnd . snd))
+        attachSelect ls = case attach of AttachNext -> filter ((== minimumBy (compare `on` srcSpanStart) (map snd ls)) . snd) ls
+                                         AttachPrevious -> filter ((== maximumBy (compare `on` srcSpanEnd) (map snd ls)) . snd) ls
 
 commentAttach :: [Located AnnotationComment] -> [Located (AnnotationComment, AttachRule)]
 commentAttach = catMaybes . map (\(L l e) -> fmap (L l) $ categorizeComment e) . foldr joinComments []
@@ -270,18 +274,21 @@ storeName sections mod (L l n)
            defLoc <- insertLoc mod (nameSrcSpan n)
            let nameStr = showSDocUnsafe (ppr n)
                tags = lookupSection sections l
-           name <- insert' always $ HsName mod file nameStr myLoc (fmap fst defLoc)
-           mapM_ (\t -> insert' always $ HsTag mod name t) tags
+           name <- insert' always $ HsName mod file nameStr myLoc (fmap fst defLoc) Nothing
+           mapM_ (\t -> insert' ifNotExist $ HsTag mod name t) tags
     else return ()
 
 insertLoc :: HasCallStack => Key HsModule -> SrcSpan -> ParseM (Maybe (Key HsSourceLoc, Key HsFile))
 insertLoc mod (RealSrcSpan rsp) = do
   file <- insertFile mod (unpackFS (srcSpanFile rsp))
-  let sloc = HsSourceLoc mod file (srcSpanStartLine rsp) (srcSpanStartCol rsp) 
-                         (srcSpanEndLine rsp) (srcSpanEndCol rsp)
-  sl <- insertWithCache ifNotExist psSourceLoc sloc -- sometimes the precise source spans do not match
+  sl <- insertWithCache ifNotExist psSourceLoc (srcSpanToLoc mod file rsp)
   return $ Just (sl,file)
 insertLoc _ _ = return Nothing
+
+srcSpanToLoc :: Key HsModule -> Key HsFile -> RealSrcSpan -> HsSourceLoc
+srcSpanToLoc mod file rsp 
+  = HsSourceLoc mod file (srcSpanStartLine rsp) (srcSpanStartCol rsp) 
+                         (srcSpanEndLine rsp) (srcSpanEndCol rsp)
 
 insertFile :: Key HsModule -> String -> ParseM (Key HsFile)
 insertFile mod str = insertWithCache ifNotExist psFile (HsFile str mod)
@@ -294,9 +301,13 @@ storeTC :: HasCallStack => ModSummary -> TcGblEnv -> ParseM TcGblEnv
 storeTC ms tc 
   = do [modKey] <- lift $ selectKeysList [HsModuleModuleName ==. showSDocUnsafe (ppr (ms_mod ms))] []
        mapM_ (storeImport modKey) (map (unLoc . snd) (ms_textual_imps ms))
-       let expressions = filter (isGoodSrcSpan . getLoc) $ universeBi (bagToList (tcg_binds tc))
+
+       -- TODO: why doesn't uniplate work on bags and how can this be fixed
+       let expressions = filter (isGoodSrcSpan . getLoc) $ universeBi $ bagToList (tcg_binds tc)
+           names = universeBi (bagToList (tcg_binds tc))
        mapM (storeInstanceInvokation modKey) $ catMaybes
          $ map (exprInstanceBind (tcg_ev_binds tc)) expressions
+       mapM_ (updateNameType modKey) (names ++ catMaybes (map exprName expressions))
        return tc
   where 
         exprInstanceBind :: Bag EvBind -> LHsExpr GhcTc -> Maybe (SrcSpan, SrcSpan)
@@ -310,6 +321,20 @@ storeTC ms tc
         wrapEvApp (WpCompose w1 w2) = wrapEvApp w1 <|> wrapEvApp w2
         wrapEvApp (WpEvApp (EvExpr expr)) = Just expr
         wrapEvApp _ = Nothing
+
+        updateNameType :: Key HsModule -> Located Id -> ParseM ()
+        updateNameType mod (L sp id)
+          = do loc <- insertLoc mod sp
+               liftIO $ putStrLn $ "Inserting type: " ++ show sp ++ ": " ++ (showSDocUnsafe (ppr (varType id)))
+               case loc of Just (l,_) -> lift $ updateWhere
+                                           [HsNameNameLocation ==. l]
+                                           [HsNameType =. Just (showSDocUnsafe (ppr (varType id)))]
+                           _ -> return ()
+
+        exprName :: LHsExpr GhcTc -> Maybe (Located Id)
+        exprName (L l (HsWrap _ _ w)) = exprName (L l w)
+        exprName (L l (HsVar _ id)) = Just $ L l $ unLoc id
+        exprName _ = Nothing
 
 storeInstanceInvokation :: Key HsModule -> (SrcSpan, SrcSpan) -> ParseM ()
 storeInstanceInvokation modKey (from,to) = do
