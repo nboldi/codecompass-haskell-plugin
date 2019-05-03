@@ -11,6 +11,7 @@ module Development.CodeCompass.Schema
 
 import Database.Persist.TH
 import Database.Persist.Sqlite
+import Data.Time.Clock
 
 import Development.CodeCompass.Representation
 
@@ -81,4 +82,18 @@ HsComment
     deriving Show
     deriving Eq
     deriving Ord
+PluginLogEvent
+    severity LogSeverity
+    moduleName String
+    text String
+    deriving Show
+    deriving Eq
+    deriving Ord
+PluginExportEvent
+    exportName String
+    exportTime UTCTime
+    deriving Show
+    deriving Eq
+    deriving Ord
+    UniquePluginExportEvent exportName
 |]

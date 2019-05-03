@@ -52,7 +52,9 @@ import Unique
 import NameEnv
 import Type
 
+import Numeric
 import Data.Char (isSpace)
+import Data.List (intercalate)
 import Data.Maybe
 import Data.IORef
 import Data.Data (toConstr)
@@ -67,16 +69,22 @@ import Control.Monad.Catch
 import Control.Monad.State
 import Control.Monad.IO.Unlift
 import Data.Text (pack)
+import qualified Data.ByteString.Char8 as BS (pack)
 import Control.Monad.Reader
 import Control.Monad.Logger
 import Conduit
 import Database.Persist
 import Database.Persist.Sqlite
+import Database.Persist.Postgresql
 import Database.Persist.TH
 import Control.Monad.IO.Class
 import Control.Lens hiding (Context(..), element)
 import GHC.Stack
 import TcEvidence
+import System.IO
+import System.TimeIt
+import Data.Time.Clock
+import System.Directory
 
 import Development.CodeCompass.Schema as Schema
 import Development.CodeCompass.Parser.Names
@@ -119,9 +127,9 @@ insert' :: (HasCallStack, PersistRecordBackend a SqlBackend, Show a) => (a -> DB
 -- TODO: the check before the insert is not always needed, might boost performance to omit
 insert' insertMethod elem
   = catch ({- do liftIO (putStrLn ("inserting" ++ (show elem))); -} lift (insertMethod elem))
-          (\e -> do liftIO $ putStrLn $ displayException e
-                    liftIO $ putStrLn $ prettyCallStack callStack
-                    throwM (e :: SomeException))
+          (\e -> do liftIO $ putStrLn $ displayException e  -- this could be removed
+                    liftIO $ putStrLn $ prettyCallStack callStack -- this could be removed
+                    throwM (e :: SomeException)) -- TODO: add info about what is inserted
 
 type DB = ReaderT SqlBackend (NoLoggingT (ResourceT IO))
 
@@ -130,36 +138,63 @@ type ParseM = StateT ParseState DB
 initState :: ParseState
 initState = PS Map.empty Map.empty Map.empty Map.empty
 
+wrapTiming :: (HasCallStack, MonadIO m) => Module -> String -> (PluginLogEvent -> m ()) -> m a -> m a
+wrapTiming mod msg insert action = do
+  (time,res) <- timeItT action
+  insert (PluginLogEvent LogInfo (showSDocUnsafe (ppr mod)) (message time))
+  return res
+  where message time = showFFloat (Just 4) time "" ++ " : " ++ msg
+
+wrapErrorHandling :: HasCallStack => Module -> DB () -> DB a -> DB a
+wrapErrorHandling mod action finale
+    = catch action (\e -> ignoreError e (void $ insert (PluginLogEvent LogError modName (errorMsg e))))
+        >> finale
+  where modName = showSDocUnsafe (ppr mod)
+        errorMsg e = displayException (e :: SomeException) ++ "\n" ++ prettyCallStack callStack
+        ignoreError orig act = catch act (\e -> do liftIO $ hPutStrLn stderr "Error occurred:"
+                                                   liftIO $ hPutStrLn stderr $ displayException (e :: SomeException)
+                                                   liftIO $ hPutStrLn stderr "While logging error:"
+                                                   liftIO $ hPutStrLn stderr (errorMsg orig))
+
+lazyStore :: Module -> Either FilePath UTCTime -> DB () -> DB ()
+lazyStore mod fpOrTime action = do
+  findMod <- selectList [PluginExportEventExportName ==. showSDocUnsafe (ppr mod)] []
+  case findMod of
+    (entityVal -> PluginExportEvent _ time) : _ -> do
+      modifyTime <- either (liftIO . getModificationTime) return fpOrTime
+      when (modifyTime > time) action
+    [] -> action
 
 parsedAction :: HasCallStack => [CommandLineOption] -> ModSummary -> HsParsedModule -> Hsc HsParsedModule
 parsedAction [] _ _
   = error "CodeCompass plugin needs a connection string to a database to store the data."
-parsedAction (connString:_) ms parse
-  = liftIO $ connectDB connString $ do 
-      cleanUp (ms_mod ms)
+parsedAction arguments ms parse
+  = liftIO $ connectDB arguments $ wrapErrorHandling (ms_mod ms) (lazyStore (ms_mod ms) (Right (ms_hs_date ms)) $ do 
+      wrapTiming (ms_mod ms) "cleanUp" (void . insert) $ cleanUp (ms_mod ms)
       flip evalStateT initState $ do
-        mod <- insertModule (ms_mod ms) (hsmodName (unLoc $ hpm_module parse))
-        comments <- liftIO $ parseForComments ms
+        mod <- wrapTiming (ms_mod ms) "insertModule" insIn $ insertModule (ms_mod ms) (hsmodName (unLoc $ hpm_module parse))
+        comments <- wrapTiming (ms_mod ms) "parseForComments" insIn $ liftIO $ parseForComments ms
         let withAttach = commentAttach comments
             moduleItself = (\n -> (getLoc n, getLoc n)) <$> hsmodName (unLoc $ hpm_module parse)
             attachableNames = map (\(n,sp) -> (getLoc n, sp)) $ hsGetNames noSrcSpan 
                            $ hsmodDecls $ unLoc $ hpm_module parse
             attachable = catMaybes [moduleItself] ++ attachableNames
-        mapM (attach mod attachable) withAttach
-        mapM (storeModuleName mod) (universeBi (hpm_module parse))
-        return parse
+        wrapTiming (ms_mod ms) "attach" insIn $ mapM_ (attach mod attachable) withAttach
+        wrapTiming (ms_mod ms) "storeModuleName" insIn $ mapM_ (storeModuleName mod) (universeBi (hpm_module parse)))
+      (return parse)
 
-storeModuleName :: Key HsModule -> Located ModuleName -> ParseM ()
+insIn = void . lift . insert
+
+storeModuleName :: HasCallStack => Key HsModule -> Located ModuleName -> ParseM ()
 storeModuleName mod (L l modName) = do 
   store <- insertLoc mod l
   findMod <- lift $ selectList [HsModuleModuleName ==. moduleNameString modName] []
   case (store, findMod) of
     (Just (loc, _), (entityVal -> HsModule _ modNameLoc):_) 
-      -> void $ insert' always $ HsName mod (moduleNameString modName) loc modNameLoc Nothing Nothing
+      -> void $ insert' ifNotExist $ HsName mod (moduleNameString modName) loc modNameLoc Nothing Nothing
     _ -> return ()
-  
 
-attach :: Key HsModule -> [(SrcSpan, SrcSpan)] -> Located (AnnotationComment, AttachRule) -> ParseM ()
+attach :: HasCallStack => Key HsModule -> [(SrcSpan, SrcSpan)] -> Located (AnnotationComment, AttachRule) -> ParseM ()
 attach mod elements (L commLoc (comm, attach)) 
   = case filter (attachCondition . snd) elements of
       [] -> return ()
@@ -170,7 +205,7 @@ attach mod elements (L commLoc (comm, attach))
         attachSelect ls = case attach of AttachNext -> filter ((== minimumBy (compare `on` srcSpanStart) (map snd ls)) . snd) ls
                                          AttachPrevious -> filter ((== maximumBy (compare `on` srcSpanEnd) (map snd ls)) . snd) ls
 
-commentAttach :: [Located AnnotationComment] -> [Located (AnnotationComment, AttachRule)]
+commentAttach :: HasCallStack => [Located AnnotationComment] -> [Located (AnnotationComment, AttachRule)]
 commentAttach = catMaybes . map (\(L l e) -> fmap (L l) $ categorizeComment e) . foldr joinComments []
   where joinComments :: (Located AnnotationComment) -> [Located AnnotationComment] -> [Located AnnotationComment]
         joinComments (L sp1@(RealSrcSpan (srcSpanStartLine -> r1)) (AnnLineComment str1))
@@ -218,8 +253,8 @@ parseForComments ms = do
 renamedAction :: HasCallStack => [CommandLineOption]
                     -> TcGblEnv -> HsGroup GhcRn
                     -> TcM (TcGblEnv, HsGroup GhcRn)
-renamedAction (connString:_) tc gr
-  = liftIO $ connectDB connString $ do
+renamedAction arguments tc gr
+  = liftIO $ connectDB arguments $ wrapErrorHandling (tcg_mod tc) (lazyStore (tcg_mod tc) (Left sourceName) $ void $ do
        let names = universeBi gr
            lieNames = universeBi (tcg_rn_exports tc) ++ universeBi (tcg_rn_imports tc) :: [Located Name]
            sortedNames = nubBy ((==) `on` getLoc) $ filter (isGoodSrcSpan . getLoc) $ sortOn getLoc (names ++ lieNames)
@@ -227,11 +262,12 @@ renamedAction (connString:_) tc gr
                       let instSections = catMaybes $ map (fmap (,Instance) . instanceSections) (concatMap group_instds $ hs_tyclds gr)
                           contextSections = concatMap (map (,Context) . getContext) (universeBi gr :: [LHsType GhcRn])
                           sections = instSections ++ contextSections
-                      mapM_ (storeName sections mod) sortedNames
-                  ) initState
-       return (tc, gr)
+                      wrapTiming (tcg_mod tc) "storeName" insIn $ mapM_ (storeName sections mod) sortedNames
+                  ) initState)
+       (return (tc, gr))
+  where sourceName = unpackFS $ srcSpanFile $ tcg_top_loc tc
 
-cleanUp :: Module -> DB ()
+cleanUp :: HasCallStack => Module -> DB ()
 cleanUp mod = do
   m <- selectKeysList [HsModuleModuleName ==. showSDocUnsafe (ppr mod)] []
   case m of
@@ -249,8 +285,22 @@ cleanUp mod = do
       mapM_ delete deps
     _ -> return ()
 
+removeAll :: HasCallStack => DB ()
+removeAll = do 
+  -- remove circular dependency
+  updateWhere [] [ HsModuleModNameLoc =. Nothing ]
+  deleteWhere ([] :: [Filter HsComment])
+  deleteWhere ([] :: [Filter HsInstanceInvokation])
+  deleteWhere ([] :: [Filter HsTag])
+  deleteWhere ([] :: [Filter HsName])
+  deleteWhere ([] :: [Filter HsSourceLoc])
+  deleteWhere ([] :: [Filter HsFile])
+  deleteWhere ([] :: [Filter HsImport])
+  deleteWhere ([] :: [Filter HsModule])
+  deleteWhere ([] :: [Filter PluginLogEvent])
+  deleteWhere ([] :: [Filter PluginExportEvent])
 
-findDependent :: Key HsModule -> DB [Key HsModule]
+findDependent :: HasCallStack => Key HsModule -> DB [Key HsModule]
 findDependent m = do
   newKeys <- selectList [HsImportImported ==. m] []
   furtherKeys <- mapM findDependent (map (hsImportImporter . entityVal) newKeys)
@@ -265,25 +315,29 @@ insertModule m (Just name) = do
               Nothing -> return ()
   return modKey
 
-connectDB :: HasCallStack => String -> DB a -> IO a
-connectDB connString = runSqlite (pack (drop 1 $ dropWhile (/='=') connString))
+connectDB :: HasCallStack => [String] -> DB a -> IO a
+connectDB (connString:_) action
+  | "sqlite" `isPrefixOf` connString = runSqlite (pack (drop 1 $ dropWhile (/='=') connString)) action
+connectDB arguments action
+  = runResourceT $ runNoLoggingT $ withPostgresqlPool (BS.pack connStr) 1 (runSqlPool action)
+  where connStr = intercalate " " arguments
 
-instanceSections :: Located (InstDecl a) -> Maybe RealSrcSpan
+instanceSections :: HasCallStack => Located (InstDecl a) -> Maybe RealSrcSpan
 instanceSections (L _ (ClsInstD _ inst)) = maybeRealSrcSpan $ findTypeFunLoc (hsib_body $ cid_poly_ty inst)
 instanceSections (L _ (DataFamInstD _ inst)) = maybeRealSrcSpan $ getLoc (feqn_tycon $ hsib_body $ dfid_eqn inst)
 instanceSections _ = Nothing
 
-findTypeFunLoc :: Located (HsType a) -> SrcSpan
+findTypeFunLoc :: HasCallStack => Located (HsType a) -> SrcSpan
 findTypeFunLoc (L _ (HsAppTy _ t _)) = findTypeFunLoc t
 findTypeFunLoc (L _ (HsOpTy _ _ (L l _) _)) = l
 findTypeFunLoc (L _ (HsParTy _ t)) = findTypeFunLoc t
 findTypeFunLoc (L l _) = l
 
-getContext :: Located (HsType a) -> [RealSrcSpan]
+getContext :: HasCallStack => Located (HsType a) -> [RealSrcSpan]
 getContext (L l (HsQualTy _ ctx _)) = catMaybes $ map (maybeRealSrcSpan . findTypeFunLoc) (unLoc ctx)
 getContext _ = []
 
-maybeRealSrcSpan :: SrcSpan -> Maybe RealSrcSpan
+maybeRealSrcSpan :: HasCallStack => SrcSpan -> Maybe RealSrcSpan
 maybeRealSrcSpan (RealSrcSpan sp) = Just sp
 maybeRealSrcSpan _ = Nothing
 
@@ -298,7 +352,8 @@ storeName sections mod (L l n)
            defLoc <- insertLoc mod (nameSrcSpan n)
            let nameStr = showSDocUnsafe (ppr n)
                tags = lookupSection sections l
-           name <- insert' always $ HsName mod nameStr myLoc (fmap fst defLoc) Nothing Nothing
+                           -- why does it need ifNotExist?
+           name <- insert' ifNotExist $ HsName mod nameStr myLoc (fmap fst defLoc) Nothing Nothing
            mapM_ (\t -> insert' ifNotExist $ HsTag mod name t) tags
     else return ()
 
@@ -309,19 +364,27 @@ insertLoc mod (RealSrcSpan rsp) = do
   return $ Just (sl,file)
 insertLoc _ _ = return Nothing
 
-srcSpanToLoc :: Key HsModule -> Key HsFile -> RealSrcSpan -> HsSourceLoc
+srcSpanToLoc :: HasCallStack => Key HsModule -> Key HsFile -> RealSrcSpan -> HsSourceLoc
 srcSpanToLoc mod file rsp 
   = HsSourceLoc mod file (srcSpanStartLine rsp) (srcSpanStartCol rsp) 
                          (srcSpanEndLine rsp) (srcSpanEndCol rsp)
 
-insertFile :: Key HsModule -> String -> ParseM (Key HsFile)
+insertFile :: HasCallStack => Key HsModule -> String -> ParseM (Key HsFile)
 insertFile mod str = insertWithCache ifNotExist psFile (HsFile str mod)
 
 typecheckPlugin :: HasCallStack => [CommandLineOption] -> ModSummary -> TcGblEnv -> TcM TcGblEnv
-typecheckPlugin (connString:_) ms tc
-  = liftIO $ connectDB connString $ evalStateT (storeTC ms tc) initState
+typecheckPlugin arguments ms tc
+  = liftIO $ connectDB arguments
+           $ wrapErrorHandling (tcg_mod tc)
+               (lazyStore (ms_mod ms) (Right (ms_hs_date ms))
+                 $ wrapTiming (ms_mod ms) "storeTypes" (void . insert)
+                 $ do evalStateT (storeTC ms tc) initState
+                      time <- liftIO getCurrentTime
+                      void $ upsert (PluginExportEvent (showSDocUnsafe $ ppr $ ms_mod ms) time)
+                                    [ PluginExportEventExportTime =. time ]
+                   ) (return tc)
 
-storeTC :: HasCallStack => ModSummary -> TcGblEnv -> ParseM TcGblEnv
+storeTC :: HasCallStack => ModSummary -> TcGblEnv -> ParseM ()
 storeTC ms tc 
   = do [modKey] <- lift $ selectKeysList [HsModuleModuleName ==. showSDocUnsafe (ppr (ms_mod ms))] []
        mapM_ (storeImport modKey) (map (unLoc . snd) (ms_textual_imps ms))
@@ -333,40 +396,37 @@ storeTC ms tc
        mapM (storeInstanceInvokation modKey) $ catMaybes
          $ map (exprInstanceBind (tcg_ev_binds tc)) expressions
        mapM_ (updateNameType modKey implicitTypeArgs) (names ++ catMaybes (map exprName expressions))
-
-       liftIO $ putStrLn $ showSDocUnsafe $ ppr implicitTypeArgs
-       return tc
   where 
-        exprInstanceBind :: Bag EvBind -> LHsExpr GhcTc -> Maybe (SrcSpan, SrcSpan)
+        exprInstanceBind :: HasCallStack => Bag EvBind -> LHsExpr GhcTc -> Maybe (SrcSpan, SrcSpan)
         exprInstanceBind evBinds (L l (HsWrap _ w _))
           | Just (Var id) <- wrapEvApp w
           , EvBind { eb_rhs = EvExpr (Var dictId) } : _ <- bagToList (filterBag (\ev -> eb_lhs ev == id) evBinds)
           = Just (l, nameSrcSpan (Var.varName dictId))
         exprInstanceBind _ _ = Nothing
 
-        exprTypeApps :: LHsExpr GhcTc -> Maybe (SrcSpan, [Type])
+        exprTypeApps :: HasCallStack => LHsExpr GhcTc -> Maybe (SrcSpan, [Type])
         exprTypeApps (L l (HsWrap _ w _))
           = case wrapTyApp w of [] -> Nothing
                                 tys -> Just (l, tys)
         exprTypeApps _ = Nothing
 
-        wrapEvApp :: HsWrapper -> Maybe EvExpr
+        wrapEvApp :: HasCallStack => HsWrapper -> Maybe EvExpr
         wrapEvApp (WpCompose w1 w2) = wrapEvApp w1 <|> wrapEvApp w2
         wrapEvApp (WpEvApp (EvExpr expr)) = Just expr
         wrapEvApp _ = Nothing
 
-        wrapTyApp :: HsWrapper -> [Type]
+        wrapTyApp :: HasCallStack => HsWrapper -> [Type]
         wrapTyApp (WpCompose w1 w2) = wrapTyApp w1 ++ wrapTyApp w2
         wrapTyApp (WpTyApp t) = [t]
         wrapTyApp _ = []
 
-        updateNameType :: Key HsModule -> [(SrcSpan, [Type])] -> Located Id -> ParseM ()
+        updateNameType :: HasCallStack => Key HsModule -> [(SrcSpan, [Type])] -> Located Id -> ParseM ()
         updateNameType mod typeArgs (L sp var)
           = do loc <- insertLoc mod sp
                let nameType = varType var
                    actualArgs = lookup sp typeArgs
                    numArgs = length $ fst $ splitForAllTys (varType var)
-                   concretiseType :: Type -> Type
+                   concretiseType :: HasCallStack => Type -> Type
                    concretiseType t = maybe t (\args -> if length args <= numArgs then piResultTys t args else t) actualArgs
                case loc of Just (l,_) -> lift $ updateWhere
                                            [ HsNameNameLocation ==. l ]
@@ -375,12 +435,12 @@ storeTC ms tc
                                            ]
                            _ -> return ()
 
-        exprName :: LHsExpr GhcTc -> Maybe (Located Id)
+        exprName :: HasCallStack => LHsExpr GhcTc -> Maybe (Located Id)
         exprName (L l (HsWrap _ _ w)) = exprName (L l w)
         exprName (L l (HsVar _ id)) = Just $ L l $ unLoc id
         exprName _ = Nothing
 
-storeInstanceInvokation :: Key HsModule -> (SrcSpan, SrcSpan) -> ParseM ()
+storeInstanceInvokation :: HasCallStack => Key HsModule -> (SrcSpan, SrcSpan) -> ParseM ()
 storeInstanceInvokation modKey (from,to) = do
     fromLoc <- insertLoc modKey from
     toLoc <- insertLoc modKey to
