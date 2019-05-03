@@ -21,6 +21,7 @@ executable codecompass-sqlite-init
     , persistent-sqlite
     , persistent-template
     , codecompass
+  default-language:    Haskell2010
 
 executable codecompass-postgresql-init
   main-is: Main.hs
@@ -36,11 +37,13 @@ executable codecompass-postgresql-init
     , codecompass
     , resourcet
     , monad-logger
+  default-language:    Haskell2010
 
 library
   exposed-modules:
     Development.CodeCompass.Parser.Plugin
     Development.CodeCompass.Parser.Names
+    Development.CodeCompass.Parser.Utils
     Development.CodeCompass.Schema
 
   other-modules:
@@ -67,6 +70,8 @@ library
     , timeit
     , time
     , directory
+
+  ghc-options: -Wunused-imports
 
   -- Directories containing source files.
   -- hs-source-dirs: src

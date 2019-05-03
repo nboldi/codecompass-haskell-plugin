@@ -1,5 +1,5 @@
 
-import Development.CodeCompass.Parser.Plugin
+import Development.CodeCompass.Parser.Utils
 
 import Database.Persist
 import Database.Persist.Postgresql

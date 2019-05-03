@@ -7,28 +7,18 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE UndecidableInstances #-}
-
-
 module Development.CodeCompass.Parser.Names where
 
 import Data.Generics.Uniplate.Data ()
-import Data.List
 
-import Bag (Bag, bagToList, unionManyBags)
-import BasicTypes (SourceText(..))
-import ConLike (ConLike(..))
-import Data.Maybe (Maybe(..), listToMaybe)
+import Bag (Bag, bagToList)
 import GHC
-import Id (Id, mkVanillaGlobal)
-import OccName (OccName)
-import Outputable (Outputable(..), showSDocUnsafe)
-import PatSyn (patSynSig)
-import RdrName (RdrName, rdrNameOcc, nameRdrName)
-import SrcLoc
-import Type (TyThing(..), mkFunTys)
+import Outputable ()
+import RdrName (RdrName)
 
 -- | Get names from the GHC AST
 class HsHasName a where
+  -- | Return the name and the location of the definition
   hsGetNames :: SrcSpan -> a -> [(Located RdrName, SrcSpan)]
 
 instance HsHasName e => HsHasName [e] where
@@ -123,13 +113,6 @@ instance HsHasName (HsBind GhcPs) where
 
 instance HsHasName (ParStmtBlock l GhcPs) where
   hsGetNames _ (ParStmtBlock _ _ binds _) = [] -- hsGetNames binds
-
--- instance HsHasName (Sig GhcPs) where
---   hsGetNames _ (ParStmtBlock _ _ binds _) = [] -- hsGetNames binds
-
-
--- instance HsHasName (LHsTyVarBndrs GhcPs) where
---   hsGetNames (HsQTvs kvs tvs) = hsGetNames kvs ++ hsGetNames tvs
 
 instance HsHasName (HsTyVarBndr GhcPs) where
   hsGetNames sp (UserTyVar _ name) = [(name, sp)]
